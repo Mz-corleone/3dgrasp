@@ -1,0 +1,7 @@
+2026-04-16 13:58:31 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
+2026-04-16 14:03:46 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
+2026-04-16 14:07:37 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
+2026-04-16 14:08:25 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
+2026-04-16 14:09:24 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
+2026-04-16 14:20:54 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
+2026-04-16 14:35:04 - libs.auxiliary - INFO: command:['ping', '-c', '1', '192.168.1.18']
