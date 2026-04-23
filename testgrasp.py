@@ -134,16 +134,17 @@ def main():
     handle = arm.rm_create_robot_arm(robot_ip, 8080)
     
     try:
-        # 松开夹爪
-        arm.rm_set_gripper_release(500, True, 1)
-        
-        # 到初始位姿
-        arm.rm_movej_p([-0.263,-0.0001,-0.238,3.141,-0.028,3.141], 20, 0, 0, 1)
-        arm.rm_set_gripper_release(500, True, 1)
 
         # 切换到Base工作坐标系，确保从原始坐标系开始计算
         ret = arm.rm_change_tool_frame("Arm_Tip")
         print(f"切换到Base工具坐标系返回码: {ret}")
+
+        # 松开夹爪
+        arm.rm_set_gripper_release(500, True, 2)
+        
+        # 到初始位姿
+        arm.rm_movej_p([-0.254,-0.00001,0.091,3.113,0.0,-1.572], 20, 0, 0, 1)
+        arm.rm_set_gripper_release(500, False, 2)
 
         print("\n=========== System Ready =============")
 
@@ -207,6 +208,10 @@ def main():
 def execute_grasp_sequence(arm, x, y, z):
     """Execute the complete grasping sequence"""
     try:
+        # 为第二次抓取准备，切换回Arm_Tip工具坐标系
+        arm.rm_change_tool_frame("Arm_Tip")
+        arm.rm_set_gripper_release(500, True, 1)
+
         # 获取当前末端位姿（原始工具坐标系）
         state, pose = arm.rm_get_current_arm_state()
         if state != 0:
@@ -239,15 +244,23 @@ def execute_grasp_sequence(arm, x, y, z):
         move_ret = arm.rm_movej_p(target_pose, 20, 0, 0, True)
         print(f'运动到目标返回码: {move_ret}')
 
-        # 等待运动完成
-        # arm.rm_movel_offset([0.05, 0, 0.05, 0.0, 0.0, 0.0],5,0,0,0,1)
-        time.sleep(0.5)
+        # 第一次夹取
+        # arm.rm_set_gripper_pick(500, 100, False, 1)
 
+        # 修正目标位姿
+        target_pose[2] = -0.532   # 固定z为-0.530
+        target_pose[1] -= 0.04   # y减去0.05
+        # target_pose[0] += 0.04   # x减去0.03
+        last_pose = list(target_pose)
+
+        arm.rm_movej_p(last_pose, 20, 0, 0, 1)
+        
         # 抓取物体（关闭夹爪）
         arm.rm_set_gripper_pick(500, 100, True, 1)
         arm.rm_set_gripper_pick(500, 100, True, 1)
 
-        # arm.rm_movej_p([-0.263,-0.0001,-0.238,3.141,-0.028,3.141], 20, 0, 0, 1)
+        # 回到初始位姿（工具坐标系）
+        arm.rm_movej_p([-0.263,-0.0001,-0.238,3.141,-0.028,3.141], 20, 0, 0, 1)
         # arm.rm_movej_p([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 0, 1)
         # arm.rm_movej_p([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 0, 1)
         # arm.rm_movej_p([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 0, 1)
@@ -257,7 +270,8 @@ def execute_grasp_sequence(arm, x, y, z):
         # arm.rm_moves([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 1, 1)
         # arm.rm_moves([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 1, 1)
 
-        time.sleep(0.5)
+        # 打开夹爪松开物体
+        arm.rm_set_gripper_release(500, True, 1)
         arm.rm_set_gripper_release(500, True, 1)
 
         print("Grasping sequence completed!")

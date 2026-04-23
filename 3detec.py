@@ -1,5 +1,5 @@
 # ****************************************************************************
-# 3D Cup Detection with Orbbec HW D2C + YOLOv8
+# 3D Glove Detection with Orbbec HW D2C + YOLOv8
 # ****************************************************************************
 
 import cv2
@@ -47,10 +47,10 @@ def align_point_2d_to_3d(x, y, depth_mm, intrinsic):
     return (px, py, pz)
 
 
-class OrbbecYOLOCupDetector:
-    def __init__(self, model_name, conf_threshold=0.5):
+class OrbbecYOLOGloveDetector:
+    def __init__(self, model_name, conf_threshold):
         self.conf_threshold = conf_threshold
-        self.cup_class_id = 2  # COCO cup id
+        self.Glove_class_id = 0  # COCO  id
 
         self.pipeline = ob.Pipeline()
         self.config = get_hw_d2c_config(self.pipeline)
@@ -100,7 +100,7 @@ class OrbbecYOLOCupDetector:
             
         return color_image, depth_mm
 
-    def detect_cups(self, image):
+    def detect_Gloves(self, image):
         results = self.model(image, conf=self.conf_threshold)
         detections = []
         for result in results:
@@ -109,7 +109,7 @@ class OrbbecYOLOCupDetector:
             ids = result.boxes.cls.cpu().numpy().astype(int)
 
             for box, conf, cls_id in zip(boxes, confs, ids):
-                if cls_id == self.cup_class_id:
+                if cls_id == self.Glove_class_id:
                     x1, y1, x2, y2 = box
                     detections.append((x1, y1, x2, y2, float(conf), int(cls_id)))
 
@@ -186,7 +186,7 @@ class OrbbecYOLOCupDetector:
             cv2.rectangle(overlay, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
             if pos is not None:
                 px, py, pz = pos
-                text = f'cup {conf:.2f} ({px:.2f},{py:.2f},{pz:.2f}mm)'
+                text = f'Glove {conf:.2f} ({px:.2f},{py:.2f},{pz:.2f}mm)'
                 ty = y1i - 10 if y1i > 20 else y2i + 20
                 cv2.putText(overlay, text, (x1i, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
@@ -198,7 +198,7 @@ class OrbbecYOLOCupDetector:
             depth_colormap = cv2.resize(depth_colormap, (overlay.shape[1], overlay.shape[0]))
 
         stacked = np.hstack((overlay, depth_colormap))
-        cv2.imshow('3D Cup Detection (Orbbec + YOLO)', stacked)
+        cv2.imshow('3D Glove Detection (Orbbec + YOLO)', stacked)
 
     def run(self):
         try:
@@ -209,7 +209,7 @@ class OrbbecYOLOCupDetector:
                 if color_image is None or depth_image is None:
                     continue
 
-                detections = self.detect_cups(color_image)
+                detections = self.detect_Gloves(color_image)
                 positions = [self.get_3d_position(d, depth_image) for d in detections]
 
                 curr_time = time.time()
@@ -228,5 +228,5 @@ class OrbbecYOLOCupDetector:
 
 
 if __name__ == '__main__':
-    detector = OrbbecYOLOCupDetector(model_name='yolov8n_coco', conf_threshold=0.5)
+    detector = OrbbecYOLOGloveDetector(model_name='glove', conf_threshold=0.4)
     detector.run()

@@ -59,7 +59,7 @@ def align_point_2d_to_3d(x, y, depth_mm, intrinsic):
 
 
 class OrbbecGroundingDINOGloveDetector:
-    def __init__(self, text_prompt, conf_threshold, box_threshold=0.35, text_threshold=0.25,
+    def __init__(self, text_prompt, conf_threshold, box_threshold, text_threshold,
                  config_path=None, weight_path=None):
         self.text_prompt = text_prompt
         self.conf_threshold = conf_threshold

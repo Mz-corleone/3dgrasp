@@ -1,7 +1,6 @@
 import json
 import socket
 import sys
-import threading
 import time
 
 from libs.auxiliary import get_ip
@@ -247,18 +246,18 @@ def execute_grasp_sequence(arm, x, y, z):
         arm.rm_set_gripper_pick(500, 100, True, 1)
         arm.rm_set_gripper_pick(500, 100, True, 1)
 
-        # arm.rm_movej_p([-0.263,-0.0001,-0.238,3.141,-0.028,3.141], 20, 0, 0, 1)
-        # arm.rm_movej_p([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 0, 1)
-        # arm.rm_movej_p([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 0, 1)
-        # arm.rm_movej_p([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 0, 1)
+        arm.rm_movej_p([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 0, 1)
+        arm.rm_movej_p([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 0, 1)
+        arm.rm_movej_p([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 0, 1)
 
-        # 晃动末端确保物品掉落
+        # 松开夹爪
+        arm.rm_set_gripper_release(500, False, 1)
+
+         # 晃动末端确保物品掉落
         # arm.rm_moves([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 1, 1)
         # arm.rm_moves([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 1, 1)
         # arm.rm_moves([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 1, 1)
 
-        time.sleep(0.5)
-        arm.rm_set_gripper_release(500, True, 1)
 
         print("Grasping sequence completed!")
         

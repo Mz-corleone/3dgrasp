@@ -38,7 +38,7 @@ def main():
     fps = color_profile.get_fps()
 
     # 创建rgbdate文件夹如果不存在
-    output_dir = "rgbdate"
+    output_dir = os.path.expanduser("~/rgbdate")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
