@@ -28,7 +28,7 @@ from detec2 import YOLO2DDetector
 
 
 class GraspController:
-    MODEL_NAME = 'glove'
+    MODEL_NAME = 'glove_v2'
     CONF_THRESHOLD = 0.5
     ARM_SPEED = 10
     DETECTION_SLEEP = 0.01
