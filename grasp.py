@@ -2,81 +2,86 @@ import json
 import socket
 import sys
 import time
+import threading
+import select
+import termios
+import tty
+import math
 
 from libs.auxiliary import get_ip
-
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-import math
-from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e, rm_frame_t
+from Robotic_Arm.rm_robot_interface import * #RoboticArm, rm_thread_mode_e, rm_frame_t,rm_peripheral_read_write_params_t
+from detec_yolo import OrbbecYOLOGloveDetector
 
-# Import our vision detector
-from vision_detector import OrbbecGroundingDINOGloveDetector
 
-# 相机坐标系到机械臂末端坐标系的旋转矩阵和平移向量（手眼标定得到）
-rotation_matrix = np.array([
+# ─── 常量 ───────────────────────────────────────────────
+MODEL_NAME = 'glove'
+CONF_THRESHOLD = 0.5
+ARM_SPEED = 30
+DETECTION_SLEEP = 0.01          # 检测线程 sleep 秒数
+MAIN_LOOP_SLEEP = 0.1           # 主循环 timeout 秒数
+DISPLAY_EVERY_N_FRAMES = 10     # 每 N 帧打印一次状态
+ARM_CONNECT_TIMEOUT = 5.0       # socket 连接超时秒数
+ARM_RECV_TIMEOUT = 5.0          # socket recv 超时秒数
+
+# ─── 手眼标定矩阵 ───────────────────────────────────────
+ROTATION_MATRIX = np.array([
     [-0.99531643,  0.09664755, -0.00210937],
     [-0.09513715, -0.98316625, -0.15599056],
     [-0.01714997, -0.15505928,  0.98775629]
 ])
-translation_vector = np.array([0.00926601, 0.06804014, 0.07758337])
+TRANSLATION_VECTOR = np.array([0.00926601, 0.06804014, 0.07758337])
+
+# ─── 辅助函数 ───────────────────────────────────────────
+def _send_with_timeout(client, data: bytes, timeout: float) -> bytes:
+    client.settimeout(timeout)
+    client.send(data)
+    return client.recv(8192)
 
 
 def send_cmd(client, cmd, get_pose=True):
-    client.send(cmd.encode('utf-8'))
-
+    response = _send_with_timeout(client, cmd.encode('utf-8'), ARM_RECV_TIMEOUT)
     if not get_pose:
-        client.recv(1024)
         return True
 
-    response = client.recv(4096).decode('utf-8')
-    decoder = json.JSONDecoder()
-    data_list = []
-    index = 0
+    decoded = response.decode('utf-8')
+    try:
+        # 整个响应可能包含多个 JSON 对象，用 next() 找目标
+        data_list = json.loads(decoded) if decoded.startswith('[') else [json.loads(decoded)]
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'JSON 解析失败: {e}\n原始响应: {decoded!r}')
 
-    while index < len(response):
-        try:
-            while index < len(response) and response[index].isspace():
-                index += 1
-            if index >= len(response):
-                break
-            obj, idx = decoder.raw_decode(response[index:])
-            data_list.append(obj)
-            index += idx
-        except json.JSONDecodeError:
-            break
-
-    for data in reversed(data_list):
-        if data.get('state') == 'current_arm_state':
+    target_data = None
+    for data in data_list:
+        if isinstance(data, dict) and data.get('state') == 'current_arm_state':
             target_data = data
             break
-    else:
-        raise RuntimeError('未找到有效的机械臂状态响应')
 
-    if target_data['arm_state']['err'] != [0]:
+    if target_data is None:
+        raise RuntimeError(f'未找到有效的机械臂状态响应\n原始响应: {decoded!r}')
+
+    if target_data.get('arm_state', {}).get('err', [0]) != [0]:
         raise RuntimeError(f"机械臂报错: {target_data['arm_state']['err']}")
 
     pose_raw = target_data['arm_state']['pose']
-    pose_converted = [
-        pose_raw[0] / 1000000,
-        pose_raw[1] / 1000000,
-        pose_raw[2] / 1000000,
-        pose_raw[3] / 1000,
-        pose_raw[4] / 1000,
-        pose_raw[5] / 1000,
+    return [
+        pose_raw[0] / 1_000_000,
+        pose_raw[1] / 1_000_000,
+        pose_raw[2] / 1_000_000,
+        pose_raw[3] / 1_000,
+        pose_raw[4] / 1_000,
+        pose_raw[5] / 1_000,
     ]
-    return pose_converted
 
 
 def set_base_frame(client):
-    socket_command = '{"command":"set_change_work_frame","frame_name":"Base"}'
-    send_cmd(client, socket_command, get_pose=False)
+    send_cmd(client, '{"command":"set_change_work_frame","frame_name":"Base"}', get_pose=False)
 
 
 def get_end_effector_pose(client):
-    socket_command = '{"command": "get_current_arm_state"}'
-    return send_cmd(client, socket_command)
+    return send_cmd(client, '{"command": "get_current_arm_state"}')
 
 
 def connect_robot():
@@ -85,185 +90,362 @@ def connect_robot():
         raise RuntimeError('无法找到机械臂IP，请检查网络连接')
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.settimeout(ARM_CONNECT_TIMEOUT)
     client.connect((robot_ip, 8080))
     set_base_frame(client)
     return client
 
 
 def convert_camera_to_base(x, y, z, ee_pose):
-    obj_camera_coordinates = np.array([x, y, z, 1.0])
+    obj_camera = np.array([x, y, z, 1.0])
 
-    T_camera_to_end_effector = np.eye(4)
-    T_camera_to_end_effector[:3, :3] = rotation_matrix
-    T_camera_to_end_effector[:3, 3] = translation_vector
+    T_cam_to_ee = np.eye(4)
+    T_cam_to_ee[:3, :3] = ROTATION_MATRIX
+    T_cam_to_ee[:3, 3] = TRANSLATION_VECTOR
 
-    position = ee_pose[:3]
+    position = np.array(ee_pose[:3])
     orientation = R.from_euler('xyz', ee_pose[3:], degrees=False).as_matrix()
 
-    T_base_to_end_effector = np.eye(4)
-    T_base_to_end_effector[:3, :3] = orientation
-    T_base_to_end_effector[:3, 3] = position
+    T_base_to_ee = np.eye(4)
+    T_base_to_ee[:3, :3] = orientation
+    T_base_to_ee[:3, 3] = position
 
-    obj_end_effector_coordinates_homo = T_camera_to_end_effector.dot(obj_camera_coordinates)
-    obj_base_coordinates_homo = T_base_to_end_effector.dot(obj_end_effector_coordinates_homo)
-    return obj_base_coordinates_homo[:3].tolist()
+    obj_base = T_base_to_ee @ T_cam_to_ee @ obj_camera
+    return obj_base[:3].tolist()
 
+
+def connect_arm(robot_ip: str):
+    arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
+    handle = arm.rm_create_robot_arm(robot_ip, 8080)
+    return arm
+
+# ─── 夹爪 ───────────────────────────────────────────
+class Gripper:
+    def __init__(self, arm):
+        self.arm = arm
+        self.arm.rm_set_modbus_mode(1,115200,1) #设置modbus模式
+        write_params = rm_peripheral_read_write_params_t(1, 1, 2) #设置寄存器地址为1，寄存器数量为2
+        self.arm.rm_write_single_coil(write_params, 1) #写入1使能夹爪控制
+        write_params = rm_peripheral_read_write_params_t(1, 11, 1) #设置寄存器地址为11，寄存器数量为1
+        self.arm.rm_write_single_register(write_params, 1000) #写入1000使夹爪松开
+
+    def gripper_release(self):
+        write_params = rm_peripheral_read_write_params_t(1, 10, 1) #设置寄存器地址为10，寄存器数量为1
+        self.arm.rm_write_single_register(write_params, 1000) 
+
+    def gripper_pick(self):
+        write_params = rm_peripheral_read_write_params_t(1, 10, 1) #设置寄存器地址为10，寄存器数量为1
+        self.arm.rm_write_single_register(write_params, 10)
+
+
+#arm.rm_set_modbus_mode(1,115200,1)
+#write_params = rm_peripheral_read_write_params_t(1, 10, 1)
+
+#def gripper_release(arm):
+#    write_params = rm_peripheral_read_write_params_t(1, 11, 1)
+#    arm.rm_write_single_register(write_params, 1000)
+
+#def gripper_pick(arm):
+#    write_params = rm_peripheral_read_write_params_t(1, 10, 1)
+#    arm.rm_write_single_register(write_params, 10)
+
+# ─── GraspDetector ───────────────────────────────────────
+class GraspDetector:
+    def __init__(self, model_name=MODEL_NAME, conf_threshold=CONF_THRESHOLD):
+        self.detector = OrbbecYOLOGloveDetector(model_name=model_name, conf_threshold=conf_threshold)
+        self._latest_detection = None
+        self._latest_position = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    def start_detection(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._detection_loop, daemon=True)
+        self._thread.start()
+
+    def _detection_loop(self):
+        while self._running:
+            color_image, depth_image = self.detector.get_frames()
+            if color_image is None or depth_image is None:
+                time.sleep(DETECTION_SLEEP)
+                continue
+
+            detections = self.detector.detect_Gloves(color_image)
+            with self._lock:
+                if detections:
+                    self._latest_detection = detections[0]
+                    self._latest_position = self.detector.get_3d_position(
+                        self._latest_detection, depth_image
+                    )
+                else:
+                    self._latest_detection = None
+                    self._latest_position = None
+
+            time.sleep(DETECTION_SLEEP)
+
+    def get_latest(self):
+        with self._lock:
+            return self._latest_detection, self._latest_position
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self.detector.stop()
+
+
+# ─── 抓取序列 ───────────────────────────────────────────
+def execute_grasp_sequence(arm, gripper, x, y, z):
+    arm.rm_change_tool_frame("Arm_Tip")
+
+    state, pose = arm.rm_get_current_arm_state()
+    if state != 0:
+        raise RuntimeError(f"获取机械臂状态失败, 错误码: {state}")
+    print(f'当前工具位姿:\n {pose["pose"]}')
+
+    ee_pose = pose['pose']
+    base_pos = convert_camera_to_base(x, y, z, ee_pose)
+    print(f'物体在arm基座下的坐标:\n {base_pos}')
+
+
+    # 设置/切换工具坐标系
+    tool_name = "tcp_offset"
+    tcp_pose = [0, 0, 0.33, 0, 0, math.pi/2]  # z轴+0.33m，绕z轴逆时针90°
+    frame = rm_frame_t(tool_name, tcp_pose, 1, 0, 0, 0)
+    try:
+        ret = arm.rm_set_manual_tool_frame(frame)
+    except Exception as e:
+        print(f"设置工具坐标系异常: {e}")
+    arm.rm_change_tool_frame(tool_name)
+
+    #往中心靠近一些，增加抓取成功率
+    base_pos[1] = base_pos[1] * 0.75
+    base_pos[2] = -0.534   # 固定z为-0.534
+
+    # 设置两种姿态进行抓取
+    if base_pos[0] > -0.25:     # 物体靠近机械臂时
+        base_pos[0] = base_pos[0] * 1.4  # x轴往外扩一些，避免过于靠近机械臂导致碰撞
+        target_pose = list(base_pos) + [-3.141, 0.122, 2.828]
+        move_ret = arm.rm_movej_p(target_pose, ARM_SPEED, 0, 0, True)
+        print(f'运动到目标返回码: {move_ret}')
+    else:
+        target_pose = list(base_pos) + [-3.141, -0.222, -3.092]     #3.141, -0.222, -3.092
+        # print(f'目标TCP位姿: {target_pose}')
+        move_ret = arm.rm_movej_p(target_pose, ARM_SPEED, 0, 0, True)
+        print(f'运动到目标返回码: {move_ret}')
+
+    target_pose[1] -= 0.02
+    target_pose[0] -= 0.02   # x减去0.03
+    last_pose = list(target_pose)
+
+    arm.rm_movej_p(last_pose, ARM_SPEED, 0, 0, 1)
+    #gripper =Gripper(arm)
+    gripper.gripper_pick()
+    time.sleep(3)  # 等待夹爪闭合
+    
+    # arm.rm_movej_p([-0.263, -0.0001, -0.238, 3.141, -0.028, 3.141], ARM_SPEED, 0, 0, 1)
+    
+    arm.rm_movej_p([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 0, 1)
+    # arm.rm_movej_p([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 0, 1)
+    arm.rm_movej_p([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 0, 1)
+
+    gripper.gripper_release()
+    time.sleep(0.5)  # 等待夹爪打开
+    arm.rm_movej_p([0.199, -0.246, 0.441, 2.618, -1.117, 0.037], 20, 0, 0, 1)
+    arm.rm_movej_p([0.199, -0.246, 0.441, -2.878, -1.167, -0.819], 20, 0, 0, 1)
+
+    # 放置完回到初始位置
+    arm.rm_movej_p([-0.263, -0.0001, -0.238, 3.141, -0.028, 3.141], ARM_SPEED, 0, 0, 1)
+
+    print("=========Grasping sequence completed!==========")
+
+
+def adjust_target_position(arm, target_pose, scale=0.7):
+    """如果目标不可达，将目标向机械臂方向拉近"""
+    state, pose = arm.rm_get_current_arm_state()
+    if state != 0: # 获取机械臂状态失败，无法调整
+        return target_pose
+
+    current_pos = pose['pose'][:3]
+    adjusted = list(target_pose)
+
+    # 将位置向当前位置方向拉近
+    for i in range(3):
+        adjusted[i] = current_pos[i] + (target_pose[i] - current_pos[i]) * scale
+
+    return adjusted
+
+
+def execute_second_grasp(arm, gripper, detector):
+    """抓取放置后，如果检测到新目标，运动到目标位置再到指定位置"""
+    print("\n检查是否还有目标物体...")
+    time.sleep(1)  # 等待视觉检测更新
+
+    _, latest_pos = detector.get_latest()
+    if latest_pos is None:
+        print("未检测到目标物体，跳过第二次运动")
+        return False
+
+    # 提取3D坐标
+    point_3d = latest_pos
+    x, y, z = (v / 1000 for v in point_3d)
+    print(f"[相机] 检测到目标: [{x:.3f}, {y:.3f}, {z:.3f}] m")
+
+    # 转换到基座坐标系
+    state, pose = arm.rm_get_current_arm_state()
+    if state != 0:
+        print(f"获取机械臂状态失败, 错误码: {state}")
+        return False
+
+    ee_pose = pose['pose']
+    base_pos = convert_camera_to_base(x, y, z, ee_pose)
+    print(f"[基座] 目标位置: {[f'{v:.3f}' for v in base_pos]}")
+
+    # 设置目标姿态（参考第一次抓取的逻辑）
+    base_pos[1] = base_pos[1] * 0.75
+    base_pos[2] = -0.534
+
+    if base_pos[0] > -0.25:
+        base_pos[0] = base_pos[0] * 1.4
+        target_pose = list(base_pos) + [-3.141, 0.122, 2.828]
+    else:
+        target_pose = list(base_pos) + [-3.141, -0.222, -3.092]
+
+    # 尝试运动到目标位置，返回码非0表示不可达/失败
+    print(f"运动到目标位置...")
+    move_ret = arm.rm_movej_p(target_pose, ARM_SPEED, 0, 0, True)
+
+    if move_ret != 0:
+        print(f"运动到目标位置失败(返回码:{move_ret})，尝试进一步调整...")
+        target_pose = adjust_target_position(arm, target_pose, scale=0.5)
+        move_ret = arm.rm_movej_p(target_pose, ARM_SPEED, 0, 0, True)
+
+        if move_ret != 0:
+            print("无法运动到目标位置附近，跳过")
+            return False
+
+    time.sleep(1)  # 等待稳定
+
+    # 运动到指定位置
+    final_pose = [-0.311, -0.037, -0.535, 3.138, -0.127, -3.085]
+    print(f"运动到指定位置: {[f'{v:.3f}' for v in final_pose]}")
+    arm.rm_movej_p(final_pose, ARM_SPEED, 0, 0, True)
+
+    print("=========第二次运动完成!==========")
+    return True
+
+
+# import pdb
 
 def main():
-    # Initialize vision detector
     print("Initializing vision detector...")
     try:
-        detector = OrbbecGroundingDINOGloveDetector(
-            text_prompt="a yellow gloves or a white gloves with thin black stripes.",
-            conf_threshold=0.4,
-            box_threshold=0.45,
-            text_threshold=0.35
-        )
-        # Start background detection
+        detector = GraspDetector()
         detector.start_detection()
     except Exception as e:
         print(f"Failed to initialize vision detector: {e}")
         return
 
-    # 连接机械臂
     robot_ip = get_ip()
     if not robot_ip:
         raise RuntimeError('无法找到机械臂IP，请检查网络连接')
-    arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-    handle = arm.rm_create_robot_arm(robot_ip, 8080)
-    
+    arm = connect_arm(robot_ip)
+
     try:
-        # 松开夹爪
-        arm.rm_set_gripper_release(500, True, 1)
-        
-        # 到初始位姿
-        arm.rm_movej_p([-0.263,-0.0001,-0.238,3.141,-0.028,3.141], 20, 0, 0, 1)
-        arm.rm_set_gripper_release(500, True, 1)
-
-        # 切换到Base工作坐标系，确保从原始坐标系开始计算
         ret = arm.rm_change_tool_frame("Arm_Tip")
-        print(f"切换到Base工具坐标系返回码: {ret}")
+        print(f"切换到Arm_Tip工具坐标系返回码: {ret}")
 
+        arm.rm_movej_p([-0.254, -0.00001, 0.091, 3.113, 0.0, -1.572], ARM_SPEED, 0, 0, 1)
+        gripper = Gripper(arm)
+        gripper.gripper_release()
+        time.sleep(0.5)
         print("\n=========== System Ready =============")
 
-        # Main loop - wait for key press
-        import select
-        import termios
-        import tty
-        
-        # Save terminal settings
         old_settings = termios.tcgetattr(sys.stdin)
-        
+        cached_ee_pose = None   # 缓存末端位姿，避免每帧都查询
+        ee_pose_counter = 0     # 控制末端位姿查询频率
+        frame_counter = 0       # 总帧计数器
+
         try:
-            # Set terminal to raw mode for keypress detection
             tty.setraw(sys.stdin.fileno())
-            
+
             while True:
-                # Check if key is pressed (non-blocking)
-                if select.select([sys.stdin], [], [], 0.1) == ([sys.stdin], [], []):
+                # 处理按键输入
+                if select.select([sys.stdin], [], [], MAIN_LOOP_SLEEP) == ([sys.stdin], [], []):
                     key = sys.stdin.read(1)
+                    #db.set_trace()
                     if key == 's':
-                        # Get latest detection
-                        latest_pos = detector.get_latest_position()
-                        if latest_pos is not None:
-                            x, y, z = (x / 1000 for x in latest_pos) # Convert mm to m for display
-                            print(f"\nDetected glove at: [{x:.3f}, {y:.3f}, {z:.3f}] m")
-                            print("Starting grasping sequence...")
-                            
-                            # 执行抓取序列
-                            execute_grasp_sequence(arm, x, y, z)
+                        _, grasp_pos = detector.get_latest()
+                        if grasp_pos is not None:
+                            # 保留用户修改的 point_3d 逻辑
+                            point_3d = grasp_pos
+                            x, y, z = (v / 1000 for v in point_3d)
+                            print(f"\n[相机] 手套位置: [{x:.3f}, {y:.3f}, {z:.3f}] m")
+                            print("Starting first grasping sequence...")
+                            execute_grasp_sequence(arm, gripper, x, y, z)
+
+                            # 第二次运动：到目标位置再到指定位置
+                            execute_second_grasp(arm, gripper, detector)
+
+                            # 返回初始位置
+                            print("返回初始位置...")
+                            arm.rm_movej_p([-0.263, -0.0001, -0.238, 3.141, -0.028, 3.141], ARM_SPEED, 0, 0, 1)
+
+                            # 重新检测并再次抓取
+                            print("重新检测目标，准备再次抓取...")
+                            time.sleep(1)
+                            _, new_latest_pos = detector.get_latest()
+                            if new_latest_pos is not None:
+                                point_3d_new = new_latest_pos
+                                x_new, y_new, z_new = (v / 1000 for v in point_3d_new)
+                                print(f"\n[相机] 再次抓取目标: [{x_new:.3f}, {y_new:.3f}, {z_new:.3f}] m")
+                                execute_grasp_sequence(arm, gripper, x_new, y_new, z_new)
+                            else:
+                                print("未检测到目标，跳过再次抓取")
                         else:
                             print("\nNo glove detected! Please keep glove in view and try again.")
                     elif key == 'q':
                         break
-                    # Ignore other keys
-                
-                # Get latest detection for display
-                latest_pos = detector.get_latest_position()
-                
-                # Display status
-                if latest_pos is not None:
-                    x, y, z = (x / 1000 for x in latest_pos) 
-                    print(f"\rLatest detection: [{x:.3f}, {y:.3f}, {z:.3f}] m", end="", flush=True)
-                else:
-                    print(f"\rNo glove detected yet", end="", flush=True)
-                    
+
+                # 周期性检测与显示
+                _, latest_pos = detector.get_latest()
+                frame_counter += 1
+                if frame_counter % DISPLAY_EVERY_N_FRAMES == 0:
+                    if latest_pos is not None:
+                        # 保留用户修改的 point_3d 逻辑
+                        point_3d = latest_pos
+                        x, y, z = (v / 1000 for v in point_3d)
+                        # 每 DISPLAY_EVERY_N_FRAMES 帧刷新一次末端位姿缓存
+                        ee_pose_counter += 1
+                        if ee_pose_counter >= DISPLAY_EVERY_N_FRAMES:
+                            state, pose = arm.rm_get_current_arm_state()
+                            if state == 0:
+                                cached_ee_pose = pose["pose"]
+                            ee_pose_counter = 0
+
+                        if cached_ee_pose is not None:
+                            base_pos = convert_camera_to_base(x, y, z, cached_ee_pose)
+                            print(
+                                f"\r[相机] [{x:.3f}, {y:.3f}, {z:.3f}]  "
+                                f"[基座] [{base_pos[0]:.3f}, {base_pos[1]:.3f}, {base_pos[2]:.3f}]",
+                                end="", flush=True
+                            )
+                        else:
+                            print(f"\r[相机] [{x:.3f}, {y:.3f}, {z:.3f}]  [基座] 初始化中...", end="", flush=True)
+                    else:
+                        print(f"\rNo glove detected yet", end="", flush=True)
         except KeyboardInterrupt:
             print("\nInterrupted...")
         finally:
-            # Restore terminal settings
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
     except Exception as e:
         print(f"Error during operation: {e}")
     finally:
-        # Clean up
         print("\nShutting down...")
         detector.stop()
         arm.rm_delete_robot_arm()
-
-
-def execute_grasp_sequence(arm, x, y, z):
-    """Execute the complete grasping sequence"""
-    try:
-        # 获取当前末端位姿（原始工具坐标系）
-        state, pose = arm.rm_get_current_arm_state()
-        if state != 0:
-            raise RuntimeError(f"获取机械臂状态失败, 错误码: {state}")
-        print(f'当前工具位姿:\n {pose["pose"]}')
-
-        ee_pose = pose['pose']
-        base_pos = convert_camera_to_base(x, y, z, ee_pose)
-        print(f'物体在机械臂基座坐标系下的坐标:\n {base_pos}')
-
-        # 设置/切换工具坐标系
-        tool_name = "tcp_offset"
-        tcp_pose = [0, 0, 0.33, 0, 0, math.pi/2]  # z轴+0.33m，绕z轴逆时针90°
-        frame = rm_frame_t(tool_name, tcp_pose, 1, 0, 0, 0)
-        try:
-            ret = arm.rm_set_manual_tool_frame(frame)
-        except Exception as e:
-            print(f"设置工具坐标系异常: {e}")
-        ret = arm.rm_change_tool_frame(tool_name)
-
-        # 再次获取当前末端姿态（此时已切换工具坐标系）
-        state2, pose2 = arm.rm_get_current_arm_state()
-        if state2 != 0:
-            raise RuntimeError(f"获取机械臂状态失败, 错误码: {state2}")
-        ee_pose2 = pose2['pose']
-
-        # 运动到目标点，保持当前姿态，只改位置
-        target_pose = list(base_pos) + [3.141, -0.222, 3.082]
-        print(f'目标TCP位姿: {target_pose}')
-        move_ret = arm.rm_movej_p(target_pose, 20, 0, 0, True)
-        print(f'运动到目标返回码: {move_ret}')
-
-        # 等待运动完成
-        # arm.rm_movel_offset([0.05, 0, 0.05, 0.0, 0.0, 0.0],5,0,0,0,1)
-        time.sleep(0.5)
-
-        # 抓取物体（关闭夹爪）
-        arm.rm_set_gripper_pick(500, 100, True, 1)
-        arm.rm_set_gripper_pick(500, 100, True, 1)
-
-        arm.rm_movej_p([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 0, 1)
-        arm.rm_movej_p([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 0, 1)
-        arm.rm_movej_p([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 0, 1)
-
-        # 松开夹爪
-        arm.rm_set_gripper_release(500, False, 1)
-
-         # 晃动末端确保物品掉落
-        # arm.rm_moves([-0.443, 0.038, 0.339, 3.13, -0.791, -3.038], 20, 0, 1, 1)
-        # arm.rm_moves([0.193, -0.247, 0.734, -0.559, -1.331, -3.067], 20, 0, 1, 1)
-        # arm.rm_moves([0.199, -0.246, 0.441, 2.987, -1.177, -0.367], 20, 0, 1, 1)
-
-
-        print("Grasping sequence completed!")
-        
-    except Exception as e:
-        print(f"Error during grasping sequence: {e}")
-        raise
 
 
 if __name__ == '__main__':
