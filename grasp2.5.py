@@ -1,42 +1,38 @@
+# 增加扇形抓取范围检查，调整部分参数,未验证
 import json
 import socket
 import sys
 import time
 import threading
 import select
+import termios
+import tty
 import math
-#临时测试用，键盘输入
-try:
-    import termios
-    import tty
-    POSIX_TERMIOS = True
-except Exception:
-    POSIX_TERMIOS = False
-
-try:
-    import msvcrt
-    HAS_MSVCRT = True
-except Exception:
-    HAS_MSVCRT = False
 
 from libs.auxiliary import get_ip
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from Robotic_Arm.rm_robot_interface import *
-from detec2 import YOLO2DDetector
+from detec import YOLO2DDetector
 
 
 class GraspController:
     MODEL_NAME = 'glove_v2'
     CONF_THRESHOLD = 0.5
-    ARM_SPEED = 10
+    ARM_SPEED = 60
     DETECTION_SLEEP = 0.01
     MAIN_LOOP_SLEEP = 0.1
     DISPLAY_EVERY_N_FRAMES = 10
     ARM_CONNECT_TIMEOUT = 5.0
     ARM_RECV_TIMEOUT = 5.0
-    OBJ_HIGHT = -0.536 #534
+    OBJ_HIGHT = -0.534
+    # 扇形抓取范围参数（以基座坐标系为准）
+    # 扇形中心角（弧度，0 指向 +X 轴），半角（弧度），最小/最大半径（米）
+    SECTOR_CENTER_ANGLE = 0.0
+    SECTOR_HALF_ANGLE = math.radians(30)  # +/-30度
+    SECTOR_MAX_RADIUS = 0.4
+    SECTOR_MIN_RADIUS = 0.1
 
     ROTATION_MATRIX = np.array([
         [-0.99531643,  0.09664755, -0.00210937],
@@ -122,7 +118,7 @@ class GraspController:
         cy = int(np.clip(cy_c, 0, h - 1))
         return self._align_point_2d_to_3d(cx, cy, z,
                                           self._detector.rgb_intrinsic)
-
+    
     # ─── Arm Socket Communication ───────────────────────────
 
     def _send_with_timeout(self, client, data: bytes, timeout: float) -> bytes:
@@ -222,7 +218,6 @@ class GraspController:
                 break
         time.sleep(0.1)
         self.arm.rm_close_modbus_mode(1)
-        time.sleep(0.1)
 
     def gripper_pick(self):
         self.arm.rm_set_modbus_mode(1, 115200, 2)
@@ -235,10 +230,8 @@ class GraspController:
                 break
         time.sleep(0.1)
         self.arm.rm_close_modbus_mode(1)
-        time.sleep(0.1)
 
     # ─── Detection Thread ───────────────────────────────────
-
     def start_detection(self):
         self._running = True
         self._thread = threading.Thread(target=self._detection_loop, daemon=True)
@@ -264,7 +257,7 @@ class GraspController:
 
             time.sleep(self.DETECTION_SLEEP)
 
-    def get_latest(self): # 获取最新检测结果和位置的方法
+    def get_latest(self):
         with self._lock:
             return self._latest_detection, self._latest_position
 
@@ -299,6 +292,10 @@ class GraspController:
             return None
         return target_pose
 
+    def _ang_diff(a, b):# 计算两个角度的最小差值（弧度），结果在[-pi, pi]范围内
+                d = (a - b + math.pi) % (2 * math.pi) - math.pi
+                return abs(d)
+    
     def execute_grasp_sequence(self, x, y, z):
         self.arm.rm_change_tool_frame("Arm_Tip")
         self.gripper_release()
@@ -315,22 +312,25 @@ class GraspController:
 
         tool_name = "tcp_offset"
         tcp_pose = [0, 0, 0.33, 0, 0, math.pi/2]
-        frame = rm_frame_t(tool_name, tcp_pose, 1, 0, 0, 0)
+        frame = self.arm.rm_frame_t(tool_name, tcp_pose, 1, 0, 0, 0)
         try:
             self.arm.rm_set_manual_tool_frame(frame)
         except Exception as e:
             print(f"设置工具坐标系异常: {e}")
         self.arm.rm_change_tool_frame(tool_name)
- 
-        # （新增）根据距离调整目标位置，增加抓取成功率的策略
-        if base_pos[2] > -0.525:
-            print(f"警告: 目标位置Z轴高度 {base_pos[2]:.3f} m 过高，可能无法抓取。")
-            return False
-        if base_pos[2] < -0.540:
-            base_pos[2] += 0.005
 
-        # 根据距离调整XY位置，增加抓取成功率的策略
         distance = math.sqrt(base_pos[0]**2 + base_pos[1]**2)
+
+        # --- 扇形范围检查：如果目标不在扇形内则返回当前相机坐标并结束流程 ---
+        azimuth = math.atan2(base_pos[1], base_pos[0])  # 目标在基座平面的方位角（弧度）
+        # 检查目标是否在扇形范围内
+        if (distance > self.SECTOR_MAX_RADIUS or distance < self.SECTOR_MIN_RADIUS
+                or self._ang_diff(azimuth, self.SECTOR_CENTER_ANGLE) > self.SECTOR_HALF_ANGLE):
+            print(f"目标超出扇形抓取范围: azimuth={math.degrees(azimuth):.1f}°, dist={distance:.3f}m")
+            print(f"返回相机坐标并结束抓取: [{x:.3f}, {y:.3f}, {z:.3f}] m")
+            self.arm.rm_change_tool_frame("Arm_Tip")
+            return False
+
         if distance < 0.23:
             target_pose = list(base_pos) + [-3.109, 0.117, 3.069]
             move_ret = self.arm.rm_movej_p(target_pose, self.ARM_SPEED, 0, 0, True)
@@ -340,7 +340,7 @@ class GraspController:
                 if target_pose is None:
                     return False
 
-        elif distance > 0.38:
+        elif distance > 0.35:
             # base_pos[2] += 0.005
             target_pose = list(base_pos) + [-3.141, -0.222, -3.092]
             move_ret = self.arm.rm_movej_p(target_pose, self.ARM_SPEED, 0, 0, True)
@@ -350,7 +350,8 @@ class GraspController:
                 if target_pose is None:
                     return False
 
-        else: 
+        else:
+            # base_pos[0] -= 0.015  
             target_pose = list(base_pos) + [-3.141, -0.222, -3.092]
             move_ret = self.arm.rm_movej_p(target_pose, self.ARM_SPEED, 0, 0, True)
             print(f'运动到目标返回码: {move_ret}')
@@ -358,19 +359,17 @@ class GraspController:
                 target_pose = self._retry_or_skip(target_pose)
                 if target_pose is None:
                     return False
-                
-        #滑动抓取微调，最终抓取位置，增加成功率的策略
-        if distance > 0.38:
-            # off = (-int(self.OBJ_HIGHT * 1000)) % 10
-            # target_pose[2] = self.OBJ_HIGHT + off/3 * 0.001
-             target_pose[2] = self.OBJ_HIGHT + 0.001
+
+        if distance > 0.35:
+            off = (-int(self.OBJ_HIGHT * 1000)) % 10
+            target_pose[2] = self.OBJ_HIGHT + off/2.5 * 0.001
         else:
             target_pose[2] = self.OBJ_HIGHT
-        target_pose[1] -= 0.015  # 0.02
+        target_pose[1] -= 0.02
         target_pose[0] -= 0.01
         last_pose = list(target_pose)
-        self.arm.rm_movej_p(last_pose, self.ARM_SPEED, 0, 0, 1)
 
+        self.arm.rm_movej_p(last_pose, self.ARM_SPEED, 0, 0, 1)
         self.gripper_pick()
         time.sleep(3)
 
@@ -381,6 +380,7 @@ class GraspController:
 
         self.gripper_release()
         time.sleep(0.1)
+        self.gripper_release()
 
         #晃动夹爪，增加物体掉落概率（新增点位）
         self.arm.rm_movej([-0.108,24.719,-40.406,147.014,118.97,-76.026], 
@@ -388,14 +388,9 @@ class GraspController:
         self.arm.rm_movej_p([0.199, -0.246, 0.441, 2.987, -1.177, -0.367],
                             self.ARM_SPEED + 20, 0, 0, 1) 
         
-        # self.arm.rm_movej_p([0.199, -0.246, 0.441, 2.618, -1.117, 0.037],
-        #                     self.ARM_SPEED, 0, 0, 1)
-        # self.arm.rm_movej_p([0.199, -0.246, 0.441, -2.878, -1.167, -0.819],
-                            #  self.ARM_SPEED, 0, 0, 1)
-        
         #回到初始状态
         self.arm.rm_movej_p([-0.263, -0.0001, -0.238, 3.141, -0.028, 3.141],
-                            self.ARM_SPEED, 0, 0, 1)
+                            self.ARM_SPEED + 10, 0, 0, 1)
 
         self.arm.rm_change_tool_frame("Arm_Tip")
         print("=========Grasping sequence completed!==========")
@@ -427,62 +422,33 @@ class GraspController:
             
             print("\n=========== System Ready =============")
 
+            old_settings = termios.tcgetattr(sys.stdin)
             frame_counter = 0
-            old_settings = None
-            if POSIX_TERMIOS:
-                try:
-                    old_settings = termios.tcgetattr(sys.stdin)
-                    tty.setraw(sys.stdin.fileno())
-                except Exception:
-                    old_settings = None
 
             try:
-                while True:
-                    key = None
-                    # Windows: use msvcrt for non-blocking keyboard
-                    if HAS_MSVCRT:
-                        if msvcrt.kbhit():
-                            try:
-                                k = msvcrt.getwch()
-                            except Exception:
-                                k = msvcrt.getch().decode('utf-8', errors='ignore')
-                            key = k
-                    else:
-                        # POSIX fallback using select
-                        if select.select([sys.stdin], [], [], self.MAIN_LOOP_SLEEP) == ([sys.stdin], [], []):
-                            key = sys.stdin.read(1)
+                tty.setraw(sys.stdin.fileno())
 
-                    if key is not None:
-                        if key == 's': # 开始抓取
+                while True:
+                    if select.select([sys.stdin], [], [],
+                                     self.MAIN_LOOP_SLEEP) == ([sys.stdin], [], []):
+                        key = sys.stdin.read(1)
+                        if key == 's':
                             _, latest_pos = self.get_latest()
                             if latest_pos is not None:
                                 x, y, z = (v / 1000 for v in latest_pos)
                                 print(f"\n[相机] 手套位置: [{x:.3f}, {y:.3f}, {z:.3f}] m")
                                 print("Starting grasping sequence...")
-                                first_success = self.execute_grasp_sequence(x, y, z) #执行第一次抓取
-                                if first_success:
-                                    time.sleep(1)
-                                    _, latest_pos2 = self.get_latest() #再次检测手套位置，判断是否需要第二次抓取
-                                    if latest_pos2 is not None:
-                                        x2, y2, z2 = (v / 1000 for v in latest_pos2)
-                                        print(f"\n[相机] 再次检测到手套，开始第二次抓取: [{x2:.3f}, {y2:.3f}, {z2:.3f}] m")
-                                        self.execute_grasp_sequence(x2, y2, z2)
-                                    else:
-                                        print("\n没有检测到第二次手套，停止再次抓取。")
+                                self.execute_grasp_sequence(x, y, z)
                             else:
                                 print("\nNo glove detected! Please keep glove in view and try again.")
                         elif key == 'q':
                             break
 
-                    # 如果使用 msvcrt，则在没有按键时也需要短暂睡眠
-                    if HAS_MSVCRT:
-                        time.sleep(self.MAIN_LOOP_SLEEP)
-                    
-                    # 更新屏幕显示  
+                    # 更新屏幕显示       
                     _, latest_pos = self.get_latest()
-                    frame_counter += 1
-                    if frame_counter % self.DISPLAY_EVERY_N_FRAMES == 0:
-                        if latest_pos is not None:
+                    frame_counter += 1 
+                    if frame_counter % self.DISPLAY_EVERY_N_FRAMES == 0: 
+                        if latest_pos is not None: 
                             x, y, z = (v / 1000 for v in latest_pos)
                             state, pose = arm.rm_get_current_arm_state()
                             if state == 0:
@@ -501,11 +467,7 @@ class GraspController:
             except KeyboardInterrupt:
                 print("\nInterrupted...")
             finally:
-                if POSIX_TERMIOS and old_settings is not None:
-                    try:
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-                    except Exception:
-                        pass
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
         except Exception as e:
             print(f"Error during operation: {e}")
